@@ -11,101 +11,135 @@ MAX_FILENAME_TITLE_LENGTH=100
 
 # === Helper Functions ===
 
-# Function to ensure yt-dlp and ffmpeg are installed
+# Function to ensure yt-dlp, ffmpeg, and termux-api are installed
 ensure_dependencies() {
-    local dependencies_met=true
+    local core_dependencies_met=true
+    local termux_api_found=true
 
     if ! command -v yt-dlp &>/dev/null; then
         echo "INFO: yt-dlp not found."
-        dependencies_met=false
+        core_dependencies_met=false
     fi
 
     if ! command -v ffmpeg &>/dev/null; then
         echo "INFO: ffmpeg not found."
-        dependencies_met=false
+        core_dependencies_met=false
     fi
 
-    if [ "$dependencies_met" = true ]; then
-        # echo "DEBUG: All dependencies (yt-dlp, ffmpeg) are already installed."
+    if ! command -v termux-notification &>/dev/null; then
+        echo "INFO: termux-notification (from termux-api) not found."
+        termux_api_found=false
+    fi
+
+    if [ "$core_dependencies_met" = true ] && [ "$termux_api_found" = true ]; then
+        # echo "DEBUG: All dependencies are already installed."
         return 0
     fi
 
-    echo "Attempting to install missing packages (python, ffmpeg, yt-dlp)..."
+    echo "Attempting to install missing packages..."
     if command -v pkg &>/dev/null; then
-        pkg install -y python ffmpeg || {
-            echo "ERROR: Failed to install python or ffmpeg using 'pkg'. Please install them manually."
-            exit 1
-        }
-        if pip install --upgrade yt-dlp; then
-            echo "INFO: yt-dlp installed/upgraded successfully via pip."
-        else
-            echo "ERROR: Failed to install/upgrade yt-dlp via pip. Please try installing it manually."
-            exit 1
+        local packages_to_install=()
+        if [ "$core_dependencies_met" = false ]; then
+            # yt-dlp needs python, ffmpeg is separate
+            # Check if python is needed for pip for yt-dlp
+            if ! command -v python &>/dev/null && ! command -v yt-dlp &>/dev/null; then
+                 packages_to_install+=("python")
+            fi
+            if ! command -v ffmpeg &>/dev/null; then
+                packages_to_install+=("ffmpeg")
+            fi
+        fi
+
+        if [ "$termux_api_found" = false ]; then
+            packages_to_install+=("termux-api")
+        fi
+
+        if [ ${#packages_to_install[@]} -gt 0 ]; then
+             echo "INFO: Installing with pkg: ${packages_to_install[*]}"
+             pkg install -y "${packages_to_install[@]}" || {
+                echo "ERROR: Failed to install some packages with pkg. Please review messages above."
+             }
+        fi
+
+        # Install/upgrade yt-dlp via pip if still not found or to ensure it's upgraded
+        if ! command -v yt-dlp &>/dev/null || [ "$core_dependencies_met" = false ]; then # Force pip install if core_dependencies_met was false
+            if pip install --upgrade yt-dlp; then
+                echo "INFO: yt-dlp installed/upgraded successfully via pip."
+            else
+                echo "ERROR: Failed to install/upgrade yt-dlp via pip. Please try installing it manually."
+                # yt-dlp is crucial, so we might want to exit if it fails
+                # For now, we let the final check handle it.
+            fi
         fi
     else
         echo "ERROR: Termux 'pkg' command not found. Cannot automatically install dependencies."
-        echo "Please install Python, ffmpeg, and yt-dlp (e.g., using pip) manually."
-        exit 1
+        echo "Please install Python, ffmpeg, termux-api, and yt-dlp (e.g., using pip) manually."
+        exit 1 # Cannot proceed without pkg if dependencies are missing
     fi
 
-    # Final check
+    # Final check for core components
     if ! command -v yt-dlp &>/dev/null || ! command -v ffmpeg &>/dev/null; then
-        echo "ERROR: Dependencies still missing after installation attempt. Exiting."
+        echo "ERROR: Core dependencies (yt-dlp, ffmpeg) still missing after installation attempt. Exiting."
         exit 1
     fi
-    echo "INFO: Dependencies installed successfully."
+    # For termux-notification, a warning is sufficient if it's still missing
+    if ! command -v termux-notification &>/dev/null; then
+        echo "WARNING: termux-notification still not found. Android notifications will be skipped."
+    fi
+    echo "INFO: Dependency check completed."
 }
 
-# Function to prompt user for YouTube URL
+
+# Function to prompt user for YouTube URL(s)
 prompt_url() {
-    read -r -p "Enter YouTube video or playlist URL: " video_url
-    if [[ -z "$video_url" ]]; then
-        echo "ERROR: No URL entered. Exiting."
+    read -r -p "Enter YouTube video or playlist URL(s) (space-separated): " video_url_line
+    if [[ -z "$video_url_line" ]]; then
+        echo "ERROR: No URL(s) entered. Exiting."
         exit 1
     fi
+    read -r -a video_urls_to_process <<< "$video_url_line"
 }
+
 
 # Function to prompt user for quality and set format
 prompt_quality_and_format() {
     echo "Choose the download option:"
     echo "  1. Best video + best audio (merged into MP4)"
     echo "  2. Best single file (MP4, highest quality Video+Audio pre-merged stream)"
-    echo "  3. 1440p max video + best audio (merged into MP4)"
+    echo "  3. 1440p max video + best audio (merged into MP4)  <--- Approx 2K resolution"
     echo "  4. Best audio only (default container, typically M4A or Opus)"
     echo "  5. Best audio only (converted to MP3)"
-    read -r -p "Enter option (1-5): " quality_choice
+    read -r -p "Enter option (1-5) [Press Enter for default: 3 (1440p/2K)]: " quality_choice
 
-    # Initialize format_selection and an array for any extra yt-dlp arguments
+    if [[ -z "$quality_choice" ]]; then
+        echo "INFO: No quality selected, using default option 3 (1440p/2K)."
+        quality_choice="3"
+    fi
+
     format_selection=""
     yt_dlp_extra_args=()
 
     case $quality_choice in
-        1) format_selection="bv*+ba/b";; # Best video, best audio, /b for best overall if specific combo fails
-        2) format_selection="best";;     # Single best quality file
+        1) format_selection="bv*+ba/b";;
+        2) format_selection="best";;
         3) format_selection="bestvideo[height<=1440]+bestaudio/best[height<=1440]";;
-        4) format_selection="bestaudio/ba";; # 'ba' is an alias for 'bestaudio'
-        5) format_selection="bestaudio/ba"; yt_dlp_extra_args=(--extract-audio --audio-format mp3 --audio-quality "0");; # VBR quality 0-9, 0 is best
-        *) echo "ERROR: Invalid option selected. Exiting."; exit 1;;
+        4) format_selection="bestaudio/ba";;
+        5) format_selection="bestaudio/ba"; yt_dlp_extra_args=(--extract-audio --audio-format mp3 --audio-quality "0");;
+        *) echo "ERROR: Invalid option selected ('$quality_choice'). Please choose a number from 1 to 5. Exiting."; exit 1;;
     esac
 }
 
 # Function to prompt for destination folder
 prompt_destination() {
     read -r -p "Enter the destination folder (default: $DEFAULT_DEST_FOLDER): " dest_folder_input
-    # If input is empty, use default; otherwise, use input
     dest_folder="${dest_folder_input:-$DEFAULT_DEST_FOLDER}"
-
-    # Expand ~ (tilde) to $HOME directory if it's at the start of the path
     dest_folder="${dest_folder/#\~/$HOME}"
 
-    # Create the destination folder if it doesn't exist
     if ! mkdir -p "$dest_folder"; then
         echo "ERROR: Could not create destination folder: $dest_folder"
-        echo "Please check permissions and the validity of the path."
         exit 1
     fi
-    # Convert to absolute path for consistent logging (optional, but good practice)
-    dest_folder="$(cd "$dest_folder" && pwd)" # cd and pwd to resolve to canonical path
+    dest_folder="$(cd "$dest_folder" && pwd)"
     echo "INFO: Files will be saved to: $dest_folder"
 }
 
@@ -114,76 +148,103 @@ prompt_destination() {
 
 ensure_dependencies
 prompt_url
-prompt_quality_and_format # This sets $format_selection, $quality_choice, and $yt_dlp_extra_args
-prompt_destination        # This sets $dest_folder
+prompt_quality_and_format
+prompt_destination
 
-# Construct the output template for yt-dlp.
-# This version uses a simpler playlist index format that results in "NA_" for single videos.
-# It was chosen because it bypassed the previous '%\x00(' errors in your environment.
-output_template="$dest_folder/%(playlist_index)s_%(title).${MAX_FILENAME_TITLE_LENGTH}s.%(ext)s"
+if [ ${#video_urls_to_process[@]} -eq 0 ]; then
+    echo "ERROR: No valid URLs were provided to process. Exiting."
+    exit 1
+fi
 
-# ---
-# Note on a more advanced template (optional, try if the simple one is too basic):
-# If you want to try the more advanced template again for cleaner filenames
-# (e.g., "01 - Title.mp4" for playlists, "Title.mp4" for single videos)
-# ensure you type it VERY carefully to avoid hidden characters:
-# output_template="$dest_folder/%(playlist_index?%(playlist_index)02d - :)s%(title).${MAX_FILENAME_TITLE_LENGTH}s.%(ext)s"
-# ---
+successful_downloads=0
+failed_downloads=0
 
-# Base yt-dlp command array
-yt_dlp_base_cmd=(
-    yt-dlp
-    -f "$format_selection"
-    --ignore-errors             # Continue downloading other videos in a playlist if one fails
-    --no-warnings               # Suppress yt-dlp warnings like "Ignoring subtitle chapters"
-    # --progress                # Uncomment for a progress bar (can be verbose)
-    # -q                        # Uncomment for quiet mode (less output)
-    -o "$output_template"
-    # --ppa "ffmpeg: -loglevel warning" # Reduce ffmpeg's verbosity during merges/conversions
-)
+for current_video_url in "${video_urls_to_process[@]}"; do
+    echo "--------------------------------------------------"
+    echo "Processing URL: $current_video_url"
+    echo "--------------------------------------------------"
 
-# Add video-specific options if the choice is NOT audio-only (options 4 or 5)
-if [[ "$quality_choice" -ne 4 && "$quality_choice" -ne 5 ]]; then
-    yt_dlp_base_cmd+=(
-        --embed-subs            # Embed subtitles into the video container (if supported)
-        --sub-langs "en.*,en"   # Download English subtitles (all variants like en-US, en-GB)
-        --write-subs            # Also write subtitles to a separate file (as backup/alternative)
-        --merge-output-format "mp4" # If merging formats (e.g., video+audio), output as MP4
+    # Construct the output template for cleaner filenames.
+    # TYPE THIS LINE CAREFULLY to avoid hidden characters.
+    output_template="$dest_folder/%(playlist_index?%(playlist_index)02d - :)s%(title).${MAX_FILENAME_TITLE_LENGTH}s.%(ext)s"
+
+    # Base yt-dlp command array
+    yt_dlp_base_cmd=(
+        yt-dlp
+        -f "$format_selection"
+        --ignore-errors       # Continue on individual download errors in a batch
+        --no-warnings         # Suppress yt-dlp's own warnings (e.g., about subtitles)
+        --no-overwrites       # Skip download if file already exists
+        --embed-metadata      # Embed available metadata (good for tagging)
+        -o "$output_template"
+        # --ppa "ffmpeg: -loglevel error" # Optional: make ffmpeg less verbose if needed
     )
-fi
 
-# Add any extra arguments determined by quality selection (e.g., for MP3 conversion)
-if [ ${#yt_dlp_extra_args[@]} -gt 0 ]; then
-    yt_dlp_base_cmd+=("${yt_dlp_extra_args[@]}")
-fi
+    # Add video-specific options OR audio-specific options
+    if [[ "$quality_choice" -ne 4 && "$quality_choice" -ne 5 ]]; then
+        # This is a VIDEO download (options 1, 2, or 3)
+        yt_dlp_base_cmd+=(
+            --embed-subs
+            --sub-langs "en.*,en"
+            --write-subs
+            --merge-output-format "mp4"
+        )
+    else
+        # This is an AUDIO download (options 4 or 5)
+        yt_dlp_base_cmd+=(
+            --embed-thumbnail # Embed video thumbnail as album art
+        )
+    fi
 
-# Add the URL to the command
-yt_dlp_base_cmd+=("$video_url")
+    # Add any extra arguments determined by quality selection (e.g., for MP3 conversion for option 5)
+    if [ ${#yt_dlp_extra_args[@]} -gt 0 ]; then
+        yt_dlp_base_cmd+=("${yt_dlp_extra_args[@]}")
+    fi
 
-# Announce action
+    # Add the CURRENT URL from the loop to the command
+    yt_dlp_base_cmd+=("$current_video_url")
+
+    # Announce action for the current URL
+    echo "Starting download process for: $current_video_url"
+    echo "  Quality option: $quality_choice"
+    echo "  Format string: $format_selection ${yt_dlp_extra_args[*]}"
+    echo "  Saving to: $dest_folder"
+    # For debugging: echo "  Full command: ${yt_dlp_base_cmd[*]}"
+
+    # Execute the yt-dlp command for the current URL
+    if "${yt_dlp_base_cmd[@]}"; then
+        echo "" # Newline for cleaner separation
+        echo "✅ Download process completed for: $current_video_url"
+        ((successful_downloads++))
+    else
+        echo "" # Newline for cleaner separation
+        echo "❌ yt-dlp command failed for: $current_video_url (exit code $?)."
+        echo "   There might have been errors during its download."
+        ((failed_downloads++))
+    fi
+done
+
 echo "--------------------------------------------------"
-echo "Starting download process..."
-echo "  URL: $video_url"
-echo "  Quality option: $quality_choice"
-echo "  Format string: $format_selection ${yt_dlp_extra_args[*]}" # Show extra args if any
-echo "  Saving to: $dest_folder"
-# For debugging, you can print the full command:
-# echo "  Full command: ${yt_dlp_base_cmd[*]}"
-echo "--------------------------------------------------"
+echo "All specified URLs have been processed."
+echo "Successful downloads: $successful_downloads"
+echo "Failed downloads: $failed_downloads"
+echo "Files should be located in: $dest_folder"
 
-# Execute the yt-dlp command
-if "${yt_dlp_base_cmd[@]}"; then
-    echo "" # Newline for cleaner separation after yt-dlp output
-    echo "✅ Download process completed."
-    echo "   Files should be located in: $dest_folder"
+if command -v termux-notification &>/dev/null; then
+    total_processed=${#video_urls_to_process[@]}
+    notification_title="YT-DL Script Finished"
+    notification_content="Processed $total_processed URL(s). Success: $successful_downloads, Failed: $failed_downloads. Files in $dest_folder"
+
+    termux-notification \
+        --title "$notification_title" \
+        --content "$notification_content" \
+        --id "ytdl-script-status" \
+        --priority high \
+        --sound # Makes a sound
+    echo "INFO: Sent notification via Termux."
 else
-    echo "" # Newline for cleaner separation
-    echo "❌ yt-dlp command failed with exit code $?."
-    echo "   There might have been errors during the download."
-    echo "   Please check the output above for details."
-    echo "   Partially downloaded files, if any, might be in: $dest_folder"
-    echo "   (or your current directory if the -o path specification failed early)."
+    echo "INFO: termux-notification command not found. Skipping Android notification."
+    echo "      You can try installing it with: pkg install termux-api"
 fi
 
 exit 0
-
